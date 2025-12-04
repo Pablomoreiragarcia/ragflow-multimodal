@@ -1,0 +1,6 @@
+*:Zone.Identifier
+
+# Env files
+.env
+*.env
+infra/.env

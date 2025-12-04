@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+langchain
+langgraph
+pydantic
+python-dotenv
+minio==7.2.7
+qdrant-client
+httpx
+requests
+python-multipart
+pymupdf
+sentence-transformers
+torch
+openai
+camelot-py[base]
+pandas
