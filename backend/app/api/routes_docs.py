@@ -1,14 +1,11 @@
 # backend/app/api/routes_docs.py
 
 import json
-from app.storage.minio_client import list_objects, download_file  # asumiendo helpers
+from app.storage.minio_client import list_objects, download_file, delete_file  # asumiendo helpers
 from app.ingestion.pdf_ingest import process_pdf
-
+from app.vectorstores.qdrant_client import delete_by_doc_id
 from fastapi import APIRouter, HTTPException
 from typing import List, Dict
-
-from app.storage.minio_client import list_objects, delete_file
-from app.vectorstores.qdrant_client import delete_by_doc_id
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -26,10 +23,22 @@ def list_documents() -> Dict:
         key = obj["key"]
         if key.endswith("/original.pdf"):
             doc_id = key.split("/")[0]
+
+            original_filename = None
+            
+            try:
+                meta_bytes = download_file(f"docs_meta/{doc_id}.json")
+                meta = json.loads(meta_bytes.decode("utf-8"))
+                original_filename = meta.get("original_filename")
+            except Exception:
+                # Si no hay metadatos, dejamos None y hacemos fallback al doc_id
+                original_filename = None
+
             docs.append({
                 "doc_id": doc_id,
                 "pdf_path": key,
                 "size": obj["size"],
+                "original_filename": original_filename or doc_id,
             })
 
     return {"documents": docs}

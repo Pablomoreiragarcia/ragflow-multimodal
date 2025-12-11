@@ -1,7 +1,13 @@
+# backend/app/api/routes_ask.py
+
 from typing import List, Optional, Dict, Any
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from minio.error import S3Error
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.embeddings.text_embeddings import get_embedding_model
 from app.vectorstores.qdrant_client import (
@@ -11,17 +17,19 @@ from app.vectorstores.qdrant_client import (
 from app.storage.minio_client import download_file
 from app.llm.chat import call_llm
 
-from minio.error import S3Error
-from qdrant_client.http.exceptions import UnexpectedResponse
-
 router = APIRouter()
-_model = get_embedding_model()
+
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
 
 
 class AskRequest(BaseModel):
     question: str
     top_k: int = 5
-    doc_ids: Optional[List[str]] = None  # filtrar por documentos concretos
+    doc_ids: Optional[List[str]] = None
+    history: Optional[List[ChatTurn]] = None
 
 
 class AskResponse(BaseModel):
@@ -31,12 +39,45 @@ class AskResponse(BaseModel):
     image_path: Optional[str] = None
 
 
-@router.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest):
-    # Vector CLIP de la pregunta (mismo modelo que usaste para indexar)
-    q_vec = _model.encode(req.question).tolist()
+_model = None
 
-    # 1) Buscar en Qdrant con manejo de errores
+
+def _get_model():
+    global _model
+    if _model is None:
+        _model = get_embedding_model()
+    return _model
+
+
+@router.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest) -> AskResponse:
+    # 1) Modelo de embeddings
+    try:
+        model = _get_model()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": "EMBEDDING_MODEL_ERROR",
+                "message": "No he podido inicializar el modelo de embeddings.",
+                "details": str(e),
+            },
+        )
+
+    # 2) Embedding de la pregunta
+    try:
+        q_vec = model.encode(req.question).tolist()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": "EMBEDDING_ENCODE_ERROR",
+                "message": "No he podido calcular el embedding de la pregunta.",
+                "details": str(e),
+            },
+        )
+
+    # 3) Búsquedas en Qdrant
     try:
         hits = search_text_and_tables(
             query_vector=q_vec,
@@ -68,7 +109,7 @@ def ask(req: AskRequest):
             },
         )
 
-    # --- Construir contexto de texto ---
+    # 4) Construir contexto texto/tablas
     context_points: List[Dict[str, Any]] = []
     context_parts: List[str] = []
 
@@ -86,7 +127,6 @@ def ask(req: AskRequest):
             if csv_path and not first_table_path:
                 first_table_path = csv_path
 
-        
         ctx_item = {
             "content": content,
             "metadata": {
@@ -101,9 +141,7 @@ def ask(req: AskRequest):
         context_points.append(ctx_item)
         context_parts.append(content)
 
-        
-
-    # --- Procesar imagen ---
+    # 5) Imagen (opcional)
     first_image_path: Optional[str] = None
     image_bytes: Optional[bytes] = None
 
@@ -112,7 +150,6 @@ def ask(req: AskRequest):
         meta = img_payload.get("metadata", {}) or {}
         first_image_path = meta.get("image_path") or img_payload.get("image_path")
 
-        # chunk para que la UI pueda mostrar la imagen 👇
         img_ctx = {
             "content": img_payload.get("content", ""),
             "metadata": {
@@ -129,7 +166,7 @@ def ask(req: AskRequest):
             try:
                 image_bytes = download_file(first_image_path)
             except S3Error:
-                image_bytes = None  # no reventamos si falla la descarga
+                image_bytes = None
 
     if not context_points and not first_image_path:
         return AskResponse(
@@ -141,19 +178,26 @@ def ask(req: AskRequest):
             table_path=None,
             image_path=None,
         )
-    # ---------- Contexto plano para el LLM ----------
-    context_text = "\n".join(c["content"] for c in context_points)
 
-    # 3) Llamada real al LLM (texto + imagen)
+    context_text = "\n".join(context_parts)
+
+    # 6) Historial en formato simple (list[dict]) para call_llm
+    history_for_llm: Optional[List[Dict[str, str]]] = None
+    if req.history:
+        history_for_llm = [
+            {"role": t.role, "content": t.content} for t in req.history
+        ]
+
+    # 7) Llamada al LLM
     try:
         answer = call_llm(
             question=req.question,
             context=context_text,
             table_path=first_table_path,
             image_bytes=image_bytes,
+            history=history_for_llm,
         )
     except Exception as e:
-        # No rompemos la API; devolvemos el contexto y un mensaje claro
         answer = (
             "He recuperado contexto de los documentos, pero se ha producido un error "
             "al llamar al modelo de lenguaje. Un administrador puede revisar los logs. "

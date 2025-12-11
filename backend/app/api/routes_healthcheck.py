@@ -60,3 +60,16 @@ def healthcheck():
         qdrant=DependencyStatus(ok=qdrant_ok, detail=qdrant_detail),
         openai_api_key=DependencyStatus(ok=openai_ok, detail=openai_detail),
     )
+
+
+
+
+# from fastapi import APIRouter
+
+# router = APIRouter()
+
+# @router.get("/health")
+# def healthcheck():
+#     # Healthcheck minimalista para desarrollo:
+#     # si la app ha arrancado, devuelve 200 y ya.
+#     return {"status": "ok"}

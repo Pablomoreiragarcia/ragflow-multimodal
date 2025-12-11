@@ -31,9 +31,19 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Dict]:
             logger.info("[TABLE_EXTRACTOR] Tabla %d raw shape: %s", idx, df_raw.shape)
             logger.info("[TABLE_EXTRACTOR] Tabla %d raw head():\n%s", idx, df_raw.head())
 
-            if df_raw.dropna(how="all").shape[0] <= 1:
-                logger.info("[TABLE_EXTRACTOR] Tabla %d vacía, se ignora.", idx)
+            df_tmp = df_raw.copy()
+            df_tmp = df_tmp.replace(r"^\s*$", pd.NA, regex=True)
+
+            # Si todas las filas están vacías o solo hay la cabecera -> descartar
+            if df_tmp.dropna(how="all").shape[0] <= 1:
+                logger.info("[TABLE_EXTRACTOR] Tabla %d vacía tras limpiar, se ignora.", idx)
                 continue
+
+            # Si todas las columnas están vacías -> descartar
+            if df_tmp.dropna(axis=1, how="all").shape[1] == 0:
+                logger.info("[TABLE_EXTRACTOR] Tabla %d sin columnas útiles, se ignora.", idx)
+                continue
+            
             # 👉 Limpiar celdas vacías y descartar tablas totalmente vacías
             header = df_raw.iloc[0].tolist()
             df_clean = df_raw.iloc[1:].reset_index(drop=True)
@@ -45,7 +55,7 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Dict]:
             tables_data.append({
                 "page": t.page,
                 "df": df_clean,
-                "index": idx,   # opcionalmente guardamos el índice
+                "idx": idx,   # opcionalmente guardamos el índice
             })
 
     return tables_data

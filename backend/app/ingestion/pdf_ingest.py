@@ -131,11 +131,21 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
         page_num = table["page"]
         table_idx = table.get("idx", 0)
 
+        if df.empty:
+            logger.warning(
+                "[PDF_INGEST] Tabla %d en página %d está vacía, no se guarda CSV.",
+                table_idx, page_num
+            )
+            continue
 
         # Guardar CSV completo en MinIO (con headers correctos)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         csv_path = f"{doc_id}/tables/table_{page_num}_table_{table_idx}.csv"
-
+        logger.info(
+            "[PDF_INGEST] CSV para %s tiene %d bytes",
+            csv_path,
+            len(csv_bytes)
+        )
         upload_bytes(csv_path, csv_bytes)
         logger.info(f"[PDF_INGEST] Guardando tabla {table_idx} de página {page_num} en {csv_path}")
         logger.info("[PDF_INGEST] Tabla %d head():\n%s" % (table_idx, df.head()))
