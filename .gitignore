@@ -1,6 +1,83 @@
-*:Zone.Identifier
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Env files
+# -------------------------
+# Virtualenv / env
+# -------------------------
+.venv/
+venv/
+ENV/
+env/
+.conda/
+
+# -------------------------
+# Django
+# -------------------------
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+static/
+
+# Si usas variables en archivos locales
 .env
-*.env
-infra/.env
+.env.*
+!.env.example
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# IDE / OS
+# -------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Build / distribution
+# -------------------------
+build/
+dist/
+*.egg-info/
+
+# -------------------------
+# Test / coverage
+# -------------------------
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -------------------------
+# HuggingFace / Transformers / Sentence-Transformers
+# (muy importante: NO subir modelos ni caches)
+# -------------------------
+.cache/
+**/.cache/
+hf_cache/
+**/huggingface/
+**/sentence-transformers/
+**/transformers/
+
+# -------------------------
+# Celery / runtime
+# -------------------------
+celerybeat-schedule
+celerybeat.pid
+
+# -------------------------
+# Docker (si tienes stuff local)
+# -------------------------
+*.pid

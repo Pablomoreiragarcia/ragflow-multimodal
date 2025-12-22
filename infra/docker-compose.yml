@@ -1,20 +1,4 @@
 services:
-  backend:
-    build:
-      context: ../backend
-    container_name: backend
-    ports:
-      - "8000:8000"
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    volumes:
-      - hf_cache:/root/.cache/huggingface
-    depends_on:
-      - qdrant
-      - minio
-    
-
-
   ui:
     build:
       context: ../ui
@@ -22,11 +6,143 @@ services:
     ports:
       - "8501:8501"
     depends_on:
-      - backend
+      - backend_django
     environment:
-      - BACKEND_URL=http://backend:8000
+      - BACKEND_URL=http://backend_django:8000
 
 
+  minio_create_buckets:
+      image: minio/mc:latest
+      depends_on:
+        minio:
+          condition: service_healthy
+      entrypoint: >
+        /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+        mc mb -p local/ragflow || true &&
+        mc policy set none local/ragflow || true
+        "
+  init_vectorstores:
+    build:
+      context: ../backend_django
+      dockerfile: Dockerfile.web
+    env_file:
+      - ../backend_django/.env
+    command: ["python", "manage.py", "init_vectorstores"]
+    volumes:
+      - ../backend_django:/app
+      - hf_cache:/app/.cache
+    depends_on:
+      qdrant:
+        condition: service_started
+  migrate:
+    build:
+      context: ../backend_django
+      dockerfile: Dockerfile.web
+    env_file:
+      - ../backend_django/.env
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    volumes:
+      - ../backend_django:/app
+      - hf_cache:/app/.cache
+    user: "1000:1000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DJANGO_DB_HOST: postgres
+      DJANGO_DB_PORT: "5432"
+      DJANGO_DB_NAME: ragflow
+      DJANGO_DB_USER: ragflow
+      DJANGO_DB_PASSWORD: ragflow
+  backend_django:
+    build:
+      context: ../backend_django
+      dockerfile: Dockerfile.web
+    container_name: backend_django
+    env_file:
+      - ../backend_django/.env
+    ports:
+      - "8001:8000"
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    volumes:
+      - ../backend_django:/app
+      - hf_cache:/app/.cache
+    user: "1000:1000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: ragflow
+      MINIO_SECURE: "false"
+      DJANGO_DB_HOST: postgres
+      DJANGO_DB_PORT: "5432"
+      DJANGO_DB_NAME: ragflow
+      DJANGO_DB_USER: ragflow
+      DJANGO_DB_PASSWORD: ragflow
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      HOME: /app
+      XDG_CACHE_HOME: /app/.cache
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/huggingface/transformers
+      SENTENCE_TRANSFORMERS_HOME: /app/.cache/sentence-transformers
+  celery_worker:
+    build:
+      context: ../backend_django
+      dockerfile: Dockerfile.worker
+    container_name: celery_worker
+    env_file:
+      - ../backend_django/.env
+    user: "1000:1000"
+    command: ["python", "-m", "celery", "-A", "config.celery:app", "worker", "-l", "info", "--concurrency=1"]
+    volumes:
+      - ../backend_django:/app
+      - hf_cache:/app/.cache
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: ragflow
+      MINIO_SECURE: "false"
+      DJANGO_DB_HOST: postgres
+      DJANGO_DB_PORT: "5432"
+      DJANGO_DB_NAME: ragflow
+      DJANGO_DB_USER: ragflow
+      DJANGO_DB_PASSWORD: ragflow
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      XDG_CACHE_HOME: /app/.cache
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/huggingface/transformers
+      SENTENCE_TRANSFORMERS_HOME: /app/.cache/sentence-transformers
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
@@ -34,9 +150,6 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-
-
-
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -55,8 +168,25 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ragflow
+      POSTGRES_USER: ragflow
+      POSTGRES_PASSWORD: ragflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragflow -d ragflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
+  pg_data:
   hf_cache:
   qdrant_data:
   minio_data:

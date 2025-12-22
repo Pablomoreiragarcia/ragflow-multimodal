@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# deps del sistema para pdf/images/tablas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ghostscript \
+    libgs10 \
+    libgl1 \
+    libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /app/.cache/huggingface /app/.cache/sentence-transformers \
+ && chown -R 1000:1000 /app/.cache
+
+COPY requirements.web.txt requirements.worker.txt ./
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.worker.txt
+
+COPY . .
+CMD ["python", "-m", "celery", "-A", "config.celery:app", "worker", "-l", "info", "--concurrency=1"]

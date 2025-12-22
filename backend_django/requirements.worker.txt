@@ -1,0 +1,9 @@
+-r requirements.web.txt
+
+sentence-transformers
+transformers
+torch
+camelot-py
+pandas
+opencv-python-headless
+PyMuPDF

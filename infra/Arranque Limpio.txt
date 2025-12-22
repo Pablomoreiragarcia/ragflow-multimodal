@@ -1,0 +1,86 @@
+0) Limpieza total (volúmenes incluidos)
+docker compose down -v
+
+1) Infra básica
+docker compose up -d postgres qdrant redis minio
+
+2) Buckets MinIO (job)
+docker compose run --rm minio_create_buckets
+
+3) Migraciones (job)
+docker compose run --rm backend_django python manage.py migrate
+
+4) Colecciones Qdrant (job)
+docker compose run --rm init_vectorstores
+
+5) Servicios “vivos”
+docker compose up -d backend_django celery_worker
+
+CHECKS
+---
+docker compose ps
+curl -fsS http://localhost:8001/api/health/ && echo
+curl -fsS http://localhost:6333/healthz && echo
+---
+RESP=$(curl -fsS -X POST "http://localhost:8001/api/documents/ingest/" \
+  -F "file=@../tests/files/multimodal_test.pdf")
+
+echo "$RESP"
+DOC_ID=$(python - << 'PY'
+import json,sys
+print(json.loads(sys.stdin.read())["id"])
+PY
+<<< "$RESP")
+
+echo "DOC_ID=$DOC_ID"
+---
+docker run --rm --network infra_default \
+  -e MC_HOST_local="http://minioadmin:minioadmin@minio:9000" \
+  minio/mc ls "local/ragflow/${DOC_ID}/"
+---
+for i in $(seq 1 60); do
+  S=$(curl -fsS "http://localhost:8001/api/documents/${DOC_ID}/status/" | python - << 'PY'
+import json,sys
+print(json.load(sys.stdin)["status"])
+PY
+)
+  echo "[$i] status=$S"
+  if [ "$S" = "ready" ] || [ "$S" = "failed" ]; then break; fi
+  sleep 1
+done
+---
+docker compose logs --tail=200 celery_worker
+---
+# Texto/tablas
+curl -fsS -X POST "http://localhost:6333/collections/text_chunks_v2/points/count" \
+  -H "Content-Type: application/json" \
+  -d '{"exact": true}' && echo
+
+# Imágenes (ajusta nombre si tu colección se llama distinto)
+curl -fsS -X POST "http://localhost:6333/collections/image_chunks/points/count" \
+  -H "Content-Type: application/json" \
+  -d '{"exact": true}' && echo
+---
+curl -fsS -X POST "http://localhost:8001/api/rag/ask/" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"¿Qué proyectos aparecen en la tabla y su estado?", "top_k": 5}' \
+  | head -c 2000
+echo
+---
+RESP2=$(curl -fsS -X POST "http://localhost:8001/api/rag/ask/" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Resume la tabla de proyectos", "top_k": 5}')
+
+CID=$(python - << 'PY'
+import json,sys
+print(json.loads(sys.stdin.read())["conversation_id"])
+PY
+<<< "$RESP2")
+
+echo "CID=$CID"
+
+curl -fsS -X POST "http://localhost:8001/api/rag/ask/" \
+  -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"$CID\",\"question\":\"¿Cuál está en progreso?\", \"top_k\": 5}" \
+  | head -c 2000
+echo
