@@ -1,18 +1,31 @@
-from django.db import transaction
-from rest_framework import status, viewsets
+# backend_django/documents/views.py
+from rest_framework import status, viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 import uuid
+from django.utils import timezone
 
-from documents.models import Document
-from documents.serializers import DocumentSerializer, DocumentIngestRequestSerializer
-from integrations.minio_client import upload_bytes, get_minio_client, get_bucket
+from documents.models import Document, Asset
+from documents.serializers import (
+    DocumentSerializer,
+    DocumentDetailSerializer,
+    DocumentIngestRequestSerializer,
+)
+from integrations.minio_client import upload_bytes
 
-
-class DocumentViewSet(viewsets.ModelViewSet):
+class DocumentViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     queryset = Document.objects.all().order_by("-created_at")
-    serializer_class = DocumentSerializer
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return DocumentDetailSerializer
+        return DocumentSerializer
 
     @action(detail=True, methods=["get"])
     def status(self, request, pk=None):
@@ -38,14 +51,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
         ser.is_valid(raise_exception=True)
 
         f = ser.validated_data["file"]
-        if not f:
-            return Response({"detail": "file is required"}, status=status.HTTP_400_BAD_REQUEST)
-
         doc_id = uuid.uuid4()
         storage_key = f"{doc_id}/original.pdf"
 
         pdf_bytes = f.read()
-        upload_bytes(object_name=storage_key, data=pdf_bytes, content_type="application/pdf")
+        upload_bytes(storage_key, pdf_bytes, "application/pdf")
 
         doc = Document.objects.create(
             id=doc_id,
@@ -58,3 +68,22 @@ class DocumentViewSet(viewsets.ModelViewSet):
         process_document.delay(str(doc.id))
 
         return Response(DocumentSerializer(doc).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"], url_path="reindex")
+    def reindex(self, request, pk=None):
+        doc = self.get_object()
+        doc.status = "pending"
+        meta = doc.meta or {}
+        meta.pop("error", None)
+        meta.pop("ingest_result", None)
+        doc.meta = meta
+        doc.updated_at = timezone.now()
+        doc.save(update_fields=["status", "meta", "updated_at"])
+
+        from documents.tasks import process_document
+        process_document.delay(str(doc.id))
+
+        return Response(
+            {"id": str(doc.id), "status": doc.status, "detail": "reindex queued"},
+            status=status.HTTP_202_ACCEPTED,
+        )

@@ -15,3 +15,14 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY . .
 EXPOSE 8000
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+
+ARG UID=1000
+ARG GID=1000
+
+RUN groupadd -g ${GID} app \
+ && useradd -m -u ${UID} -g ${GID} -s /bin/bash app
+
+ENV HOME=/app
+RUN mkdir -p /app/.cache && chown -R ${UID}:${GID} /app
+
+USER app

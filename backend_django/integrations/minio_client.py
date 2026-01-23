@@ -15,11 +15,10 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 @lru_cache(maxsize=1)
 def get_minio_client() -> Minio:
-    # MinIO SDK espera endpoint SIN esquema: "minio:9000"
-    endpoint = _env("MINIO_ENDPOINT", "minio:9000")
-    access_key = _env("MINIO_ACCESS_KEY", _env("MINIO_ROOT_USER", "minioadmin"))
-    secret_key = _env("MINIO_SECRET_KEY", _env("MINIO_ROOT_PASSWORD", "minioadmin"))
-    secure = (_env("MINIO_SECURE", "false").lower() == "true")
+    endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
+    access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
 
     return Minio(
         endpoint=endpoint,
@@ -30,7 +29,7 @@ def get_minio_client() -> Minio:
 
 
 def get_bucket() -> str:
-    return _env("MINIO_BUCKET", "ragflow")  # pon aquí tu bucket “default”
+    return os.getenv("MINIO_BUCKET", "ragflow")  # pon aquí tu bucket “default”
 
 
 def ensure_bucket(bucket: Optional[str] = None) -> None:

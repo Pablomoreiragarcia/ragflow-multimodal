@@ -1,837 +1,693 @@
-import os
+# streamlit_app.py
+from __future__ import annotations
+
 import io
-import requests
-import pandas as pd
-import streamlit as st
+import os
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urljoin
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
+import pandas as pd
+import requests
+import streamlit as st
 
 # ----------------------------
-# 🎨 Configuración básica UI
+# Config
 # ----------------------------
-st.set_page_config(
-    page_title="ragflow-multimodal",
-    page_icon="🧠",
-    layout="wide",
-)
+DEFAULT_BACKEND = "http://backenddjango:8000/api"  # ajusta si tu service se llama distinto
+BACKEND_URL = os.getenv("BACKEND_URL", DEFAULT_BACKEND).rstrip("/")
 
-# CSS sencillo para darle un poco de estilo
-st.markdown(
+st.set_page_config(page_title="ragflow-multimodal", layout="wide")
+
+# ----------------------------
+# Helpers HTTP
+# ----------------------------
+class ApiError(RuntimeError):
+    pass
+
+
+def api(path: str) -> str:
+    # path sin leading slash recomendado
+    return urljoin(BACKEND_URL + "/", path.lstrip("/") + ("" if path.endswith("/") else "/"))
+
+
+def _raise_for_status(resp: requests.Response, where: str) -> None:
+    if 200 <= resp.status_code < 300:
+        return
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = resp.text
+    raise ApiError(f"{where} -> HTTP {resp.status_code}: {payload}")
+
+
+def get_json(path: str, params: dict | None = None, timeout: int = 20) -> Any:
+    resp = requests.get(api(path), params=params, timeout=timeout)
+    _raise_for_status(resp, f"GET {path}")
+    return resp.json()
+
+
+def post_json(path: str, payload: dict | None = None, params: dict | None = None, timeout: int = 60) -> Any:
+    resp = requests.post(api(path), json=payload, params=params, timeout=timeout)
+    _raise_for_status(resp, f"POST {path}")
+    # algunos endpoints devuelven 202 con json
+    return resp.json() if resp.content else None
+
+
+def patch_json(path: str, payload: dict, timeout: int = 20) -> Any:
+    resp = requests.patch(api(path), json=payload, timeout=timeout)
+    _raise_for_status(resp, f"PATCH {path}")
+    return resp.json()
+
+
+def delete_call(path: str, timeout: int = 20) -> None:
+    resp = requests.delete(api(path), timeout=timeout)
+    _raise_for_status(resp, f"DELETE {path}")
+
+
+# ----------------------------
+# Backend functions
+# ----------------------------
+def backend_health() -> dict:
+    return get_json("health")
+
+
+def fetch_conversations() -> list[dict]:
+    # OpenAPI: GET /api/conversations/ -> list[Conversation]
+    data = get_json("conversations")
+    if isinstance(data, list):
+        return data
+    # defensivo: si algún día devuelves {"results": [...]}
+    return data.get("results", [])
+
+
+def fetch_conversation_detail(cid: str) -> dict:
+    # GET /api/conversations/{id}/ -> ConversationDetail (incluye messages)
+    return get_json(f"conversations/{cid}")
+
+
+def create_conversation(title: str = "Nueva conversación", scope: str = "all") -> dict:
+    # POST /api/conversations/
+    payload = {"title": title, "scope": scope}
+    return post_json("conversations", payload)
+
+
+def update_conversation_title(cid: str, title: str) -> dict:
+    # PATCH /api/conversations/{id}/
+    return patch_json(f"conversations/{cid}", {"title": title})
+
+
+def delete_conversation(cid: str) -> None:
+    delete_call(f"conversations/{cid}")
+
+
+def add_message(cid: str, role: str, content: str, extra: dict | None = None) -> dict:
+    # POST /api/conversations/{id}/add_message/
+    payload = {"role": role, "content": content, "extra": extra or {}}
+    return post_json(f"conversations/{cid}/add_message", payload)
+
+
+def fetch_documents() -> list[dict]:
+    data = get_json("documents")
+    if isinstance(data, list):
+        return data
+    return data.get("results", [])
+
+
+def ingest_document(file_bytes: bytes, filename: str) -> dict:
+    # POST /api/documents/ingest/ multipart (serializer: file)
+    files = {"file": (filename, file_bytes, "application/pdf")}
+    resp = requests.post(api("documents/ingest"), files=files, timeout=120)
+    _raise_for_status(resp, "POST documents/ingest")
+    return resp.json()
+
+
+def reindex_document(doc_id: str) -> dict:
+    # POST /api/documents/{id}/reindex/
+    return post_json(f"documents/{doc_id}/reindex", payload={})
+
+
+def delete_document(doc_id: str) -> None:
+    delete_call(f"documents/{doc_id}")
+
+
+# ----------------------------
+# Download tables/images (ya tienes endpoints)
+# ----------------------------
+def download_table_bytes(minio_key: str) -> bytes:
+    # GET /api/tables/download/?path=<key>
+    resp = requests.get(api("tables/download"), params={"path": minio_key}, timeout=60)
+    _raise_for_status(resp, "GET tables/download")
+    return resp.content
+
+
+def download_image_bytes(minio_key: str) -> tuple[bytes, str]:
+    # GET /api/images/download/?path=<key>
+    resp = requests.get(api("images/download"), params={"path": minio_key}, timeout=60)
+    _raise_for_status(resp, "GET images/download")
+    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+    return resp.content, content_type
+
+
+# ----------------------------
+# RAG
+# ----------------------------
+def rag_ask(question: str, history: list[dict], doc_ids: list[str] | None, top_k: int) -> dict:
+    payload = {
+        "question": question,
+        "history": history,
+        "doc_ids": doc_ids or [],
+        "top_k": int(top_k),
+    }
+    return post_json("rag/ask", payload, timeout=120)
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def safe_get_extra(msg: dict) -> dict:
+    ex = msg.get("extra")
+    return ex if isinstance(ex, dict) else {}
+
+
+def dedup_messages(messages: list[dict]) -> list[dict]:
     """
-    <style>
-    .main-title {
-        font-size: 2rem;
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-    }
-    .subtitle {
-        font-size: 0.9rem;
-        color: #888;
-    }
-    .stChatMessage {
-        border-radius: 0.6rem;
-        padding: 0.4rem 0.6rem;
-    }
-    .context-block {
-        border: 1px solid #33333355;
-        border-radius: 0.5rem;
-        padding: 0.6rem 0.8rem;
-        margin-bottom: 0.6rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    Deduplicación defensiva por si ya tienes duplicados en DB.
+    Prioriza 'id'; si no, usa (role, content, created_at).
+    """
+    seen = set()
+    out = []
+    for m in messages or []:
+        mid = m.get("id")
+        if mid:
+            k = ("id", mid)
+        else:
+            k = ("sig", m.get("role"), m.get("content"), m.get("created_at"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(m)
+    return out
 
 
-# ----------------------------
-# 🧭 Sidebar
-# ----------------------------
-with st.sidebar:
-    st.markdown('<div class="main-title">ragflow-multimodal</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Asistente RAG multimodal sobre PDFs (texto, tablas, imágenes).</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
-
-    # Selección de vista
-    page = st.radio(
-        "Vista",
-        ["💬 Chat asistente", "📂 Documentos"],
-        index=0,
-    )
-
-    st.markdown("---")
-    st.subheader("Backend health")
-
-    if st.button("Probar conexión"):
-        try:
-            r = requests.get(f"{BACKEND_URL}/health", timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                st.success("Backend OK ✅")
-                st.json(data)
-            else:
-                st.error(f"❌ Backend respondió {r.status_code}")
-        except Exception as e:
-            st.error(f"❌ No se pudo conectar con backend: {e}")
+def build_history_for_rag(messages: list[dict], max_turns: int = 12) -> list[dict]:
+    """
+    Envía al backend un history mínimo (role/content).
+    max_turns = número de mensajes, no de pares.
+    """
+    trimmed = (messages or [])[-max_turns:]
+    out = []
+    for m in trimmed:
+        role = m.get("role")
+        content = m.get("content")
+        if role and content:
+            out.append({"role": role, "content": content})
+    return out
 
 
-# ----------------------------
-# 📚 Utilidades comunes
-# ----------------------------
-def fetch_documents():
-    """Devuelve lista de documentos desde /documents o [] si falla."""
+def extract_artifacts_from_rag(data: dict) -> tuple[list[str], list[str]]:
+    """
+    Intenta extraer rutas de tablas/imágenes desde:
+      - data["tables"], data["images"] (si algún día existen)
+      - data["context"][i]["metadata"] con keys variables
+    Devuelve: (table_paths, image_paths) como lista de minio keys.
+    """
+    table_paths: list[str] = []
+    image_paths: list[str] = []
+
+    # 1) direct (si existiera)
+    t = data.get("tables")
+    if isinstance(t, list):
+        for x in t:
+            if isinstance(x, str) and x not in table_paths:
+                table_paths.append(x)
+
+    im = data.get("images")
+    if isinstance(im, list):
+        for x in im:
+            if isinstance(x, str) and x not in image_paths:
+                image_paths.append(x)
+
+    # 2) context metadata
+    ctx = data.get("context", [])
+    if isinstance(ctx, list):
+        for c in ctx:
+            if not isinstance(c, dict):
+                continue
+            meta = c.get("metadata") or {}
+            if not isinstance(meta, dict):
+                continue
+
+            modality = meta.get("modality")
+
+            if modality == "table":
+                # intenta varias keys típicas
+                for k in ("csv_path", "storage_key", "path", "key"):
+                    p = meta.get(k)
+                    if isinstance(p, str) and p and p not in table_paths:
+                        table_paths.append(p)
+
+            if modality == "image":
+                for k in ("image_path", "storage_key", "path", "key"):
+                    p = meta.get(k)
+                    if isinstance(p, str) and p and p not in image_paths:
+                        image_paths.append(p)
+
+    return table_paths, image_paths
+
+
+def wants_tables_or_images(user_text: str) -> tuple[bool, bool]:
+    q = (user_text or "").lower()
+    wants_table = any(w in q for w in ["tabla", "tablas", "table", "cuadro", "csv"])
+    wants_image = any(w in q for w in ["imagen", "imágenes", "imagenes", "figura", "foto", "gráfico", "grafico", "png", "jpg"])
+    return wants_table, wants_image
+
+
+def conversation_to_markdown(conv_detail: dict) -> str:
+    lines = []
+    lines.append(f"# {conv_detail.get('title','Conversación')}")
+    lines.append("")
+    for m in dedup_messages(conv_detail.get("messages", [])):
+        role = m.get("role", "unknown")
+        content = m.get("content", "")
+        lines.append(f"## {role}")
+        lines.append(content)
+        lines.append("")
+        ex = safe_get_extra(m)
+        tables = ex.get("tables") or []
+        images = ex.get("images") or []
+        if tables or images:
+            lines.append("### Adjuntos")
+            if tables:
+                lines.append("- Tablas:")
+                for p in tables:
+                    lines.append(f"  - {p}")
+            if images:
+                lines.append("- Imágenes:")
+                for p in images:
+                    lines.append(f"  - {p}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def render_table_attachment(csv_key: str, key_prefix: str) -> None:
     try:
-        resp = requests.get(f"{BACKEND_URL}/documents", timeout=10)
-        if resp.status_code != 200:
-            st.warning(f"⚠️ No se pudieron obtener documentos: {resp.status_code}")
-            return []
-        data = resp.json()
-        return data.get("documents", [])
+        b = download_table_bytes(csv_key)
     except Exception as e:
-        st.warning(f"⚠️ Error llamando a /documents: {e}")
-        return []
-
-
-def render_table_from_csv_path(csv_path: str, key_suffix: str):
-    try:
-        resp = requests.get(
-            f"{BACKEND_URL}/tables/download",
-            params={"path": csv_path},
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        st.error(f"⚠️ Error descargando tabla: {e}")
+        st.warning(f"No se pudo descargar la tabla: {e}")
         return
 
-    import io
-    import pandas as pd
-
-    df = pd.read_csv(io.BytesIO(resp.content))
-    render_df_with_download(df, key_suffix)
-
-
-def render_image_from_path(image_path: str, key_suffix: str = ""):
-    """Descarga y muestra una imagen desde /images/download."""
-    dl = requests.get(
-        f"{BACKEND_URL}/images/download",
-        params={"path": image_path},
-        timeout=20,
-    )
-
-    if not key_suffix:
-            key_suffix = str(uuid.uuid4())
-
-    if dl.status_code == 200:
-        st.image(dl.content, use_container_width=True)
-        st.download_button(
-            label="⬇️ Descargar imagen",
-            data=dl.content,
-            file_name=image_path.split("/")[-1],
-            mime="image/jpeg",
-            key=f"img_{image_path}_{key_suffix}",
-        )
-    else:
-        st.error(f"❌ No se pudo obtener la imagen ({dl.status_code})")
-
-
-def get_active_conversation():
-    convs = st.session_state.conversations
-    active_id = st.session_state.active_conversation_id
-    if not convs or not active_id or active_id not in convs:
-        return None
-    return convs[active_id]
-
-
-def set_active_conversation(conv_id: str):
-    if conv_id in st.session_state.conversations:
-        st.session_state.active_conversation_id = conv_id
-
-
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Asegura que no haya nombres de columna vacíos ni duplicados."""
-    new_cols = []
-    seen = {}
-
-    for i, col in enumerate(df.columns):
-        name = str(col).strip() if col is not None else ""
-
-        if not name:
-            name = f"col_{i+1}"
-
-        count = seen.get(name, 0)
-        if count > 0:
-            name = f"{name}_{count}"
-
-        seen[name] = count + 1
-        new_cols.append(name)
-
-    df = df.copy()
-    df.columns = new_cols
-    return df
-
-
-def render_df_with_download(df: pd.DataFrame, key_suffix: str):
-    df = normalize_headers(df)
-
-    st.dataframe(df, width="stretch")  # sustituye use_container_width
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    filename = os.path.basename(csv_key) or "table.csv"
+    try:
+        df = pd.read_csv(io.BytesIO(b))
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception:
+        st.info("No se pudo parsear como CSV (mostrando descarga directa).")
 
     st.download_button(
-        "⬇️ Descargar tabla en CSV",
-        data=csv_bytes,
-        file_name=f"tabla_{key_suffix}.csv",
+        "Descargar CSV",
+        data=b,
+        file_name=filename,
         mime="text/csv",
-        key=f"csv_btn_{key_suffix}",
+        key=f"{key_prefix}_dl_{filename}_{uuid.uuid4().hex[:6]}",
     )
 
 
-def ensure_conversations_loaded():
-    """Carga las conversaciones del backend en session_state si aún no están."""
-
-    # Si ya tenemos conversaciones en memoria, no volvemos a pedirlas
-    if "conversations" in st.session_state and st.session_state.conversations:
+def render_image_attachment(img_key: str, key_prefix: str) -> None:
+    try:
+        b, content_type = download_image_bytes(img_key)
+    except Exception as e:
+        st.warning(f"No se pudo descargar la imagen: {e}")
         return
 
-    try:
-        resp = requests.get(f"{BACKEND_URL}/conversations", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    filename = os.path.basename(img_key) or "image"
+    # st.image detecta formatos por bytes; content_type se usa para download
+    st.image(b, caption=filename, use_container_width=True)
 
-        # Puede venir como {"conversations": [...]} o directamente [...]
-        if isinstance(data, dict) and "conversations" in data:
-            conv_list = data["conversations"]
-        else:
-            conv_list = data or []
-
-        # Índice por id
-        st.session_state.conversations = {c["id"]: c for c in conv_list}
-
-        # Si no hay conversación activa todavía, escogemos la más reciente
-        if conv_list and not st.session_state.get("active_conversation_id"):
-            latest = max(conv_list, key=lambda c: c["created_at"])
-            st.session_state.active_conversation_id = latest["id"]
-
-    except Exception as e:
-        st.warning(f"⚠️ No se pudieron cargar conversaciones del backend: {e}")
-        # Garantizamos que las claves existen, aunque sea vacío
-        if "conversations" not in st.session_state:
-            st.session_state.conversations = {}
-        if "active_conversation_id" not in st.session_state:
-            st.session_state.active_conversation_id = None
-
-
-def get_active_conversation():
-    """Devuelve la conversación activa, consultando al backend."""
-    convs_idx = st.session_state.get("conversations", {})
-    active_id = st.session_state.get("active_conversation_id")
-
-    if not active_id:
-        return None
-
-    # Intentamos traerla del backend (estado fuente de la verdad)
-    try:
-        resp = requests.get(f"{BACKEND_URL}/conversations/{active_id}", timeout=10)
-        resp.raise_for_status()
-        conv = resp.json()
-        # Actualizamos la caché local
-        convs_idx[active_id] = conv
-        st.session_state.conversations = convs_idx
-        return conv
-    except Exception:
-        # Fallback: lo que tengamos en memoria (si existe)
-        return convs_idx.get(active_id)
-# ----------------------------
-# 🔁 Estado de sesión
-# ----------------------------
-if "active_conversation_id" not in st.session_state:
-    st.session_state.active_conversation_id = None
+    st.download_button(
+        "Descargar imagen",
+        data=b,
+        file_name=filename,
+        mime=content_type or "application/octet-stream",
+        key=f"{key_prefix}_dl_{filename}_{uuid.uuid4().hex[:6]}",
+    )
 
 
 # ----------------------------
-# 💬 Página: Chat asistente
+# Session state init
 # ----------------------------
-if page == "💬 Chat asistente":
-    ensure_conversations_loaded()
-    if not st.session_state.conversations:
-        st.info("No hay conversaciones todavía. Crea una nueva con el botón de la izquierda.")
+if "page" not in st.session_state:
+    st.session_state.page = "Chat"
 
-    st.markdown("## 💬 Chat asistente")
+if "selected_conv_id" not in st.session_state:
+    st.session_state.selected_conv_id = None
 
-    docs = fetch_documents()
-    doc_options = {f"{d.get('original_filename') or d.get('pdf_path', d['doc_id'])}": d["doc_id"] for d in docs}
+if "conv_detail" not in st.session_state:
+    st.session_state.conv_detail = None
 
-    # Layout: columna izquierda -> conversaciones, derecha -> chat
-    conv_col, chat_col = st.columns([1, 3])
+if "auto_show_attachments" not in st.session_state:
+    st.session_state.auto_show_attachments = False
 
-    # ==================================
-    # 🧵 Columna IZQUIERDA: conversaciones
-    # ==================================
-    with conv_col:
-        st.markdown("### Conversaciones")
+if "top_k" not in st.session_state:
+    st.session_state.top_k = 5
 
-        if st.button("➕ Nueva conversación"):
-            payload = {
-                "title": "Nueva conversación",
-                "scope": "Todos",
-                "doc_ids": None,
-                "messages": [],
-            }
-            try:
-                resp = requests.post(f"{BACKEND_URL}/conversations", json=payload, timeout=10)
-                resp.raise_for_status()
-                conv = resp.json()
-            except Exception as e:
-                # Fallback local por si el backend falla
-                st.warning(f"⚠️ No se pudo crear la conversación en el backend, usando conversación local: {e}")
-                conv_id = str(uuid.uuid4())
-                conv = {
-                    "id": conv_id,
-                    "title": "Nueva conversación",
-                    "messages": [],
-                    "doc_ids": None,
-                    "scope": "Todos",
-                    "created_at": datetime.utcnow().isoformat(),
-                }
+if "doc_scope" not in st.session_state:
+    st.session_state.doc_scope = "all"  # all | selected
 
-            st.session_state.conversations[conv["id"]] = conv
-            st.session_state.active_conversation_id = conv["id"]
-            st.rerun()
+if "selected_doc_ids" not in st.session_state:
+    st.session_state.selected_doc_ids = []
 
-        st.markdown("---")
 
-        convs = st.session_state.conversations
-        active_id = st.session_state.active_conversation_id
+# ----------------------------
+# Sidebar
+# ----------------------------
+with st.sidebar:
+    st.title("ragflow-\nmultimodal")
+    st.caption("Asistente RAG multimodal sobre PDFs (texto, tablas, imágenes).")
 
-        # Orden simple por fecha
-        sorted_convs = sorted(
-            convs.values(),
-            key=lambda c: c["created_at"],
-            reverse=True,
-        )
+    page = st.radio("Vista", ["Chat", "Documentos"], index=0 if st.session_state.page == "Chat" else 1)
+    st.session_state.page = page
 
-        for conv in sorted_convs:
-            cid = conv["id"]
-            is_active = (cid == active_id)
-            title = conv["title"] or "Sin título"
-            doc_ids = conv.get("doc_ids")
-            doc_label = "Todos los documentos" if not doc_ids else f"{len(doc_ids)} doc(s)"
+    st.divider()
+    st.subheader("Backend health")
+    if st.button("Probar conexión"):
+        try:
+            st.success("Backend OK")
+            st.json(backend_health())
+        except Exception as e:
+            st.error(str(e))
 
-            cols = st.columns([4, 1, 1])
-            with cols[0]:
-                if st.button(
-                    f"{'🟢 ' if is_active else ''}{title}\n{doc_label}",
-                    key=f"btn_conv_{cid}",
-                    use_container_width=True,
-                ):
-                    set_active_conversation(cid)
-                    st.rerun()
+    st.divider()
+    st.caption("BACKEND_URL")
+    st.code(BACKEND_URL)
 
-            with cols[1]:
-                if st.button("✏️", key=f"rename_{cid}"):
-                    new_title = st.text_input(
-                        "Nuevo título",
-                        value=title,
-                        key=f"title_input_{cid}",
-                    )
-                    if st.button("Guardar título", key=f"save_title_{cid}"):
-                        conv["title"] = new_title
-                        try:
-                            requests.put(
-                                f"{BACKEND_URL}/conversations/{cid}",
-                                json={"title": new_title},
-                                timeout=10,
-                            )
-                        except Exception as e:
-                            st.warning(f"No se pudo actualizar el título en backend: {e}")
-                        st.rerun()
 
-            with cols[2]:
-                if st.button("🗑", key=f"delete_{cid}"):
-                    try:
-                        requests.delete(f"{BACKEND_URL}/conversations/{cid}", timeout=10)
-                    except Exception as e:
-                        st.warning(f"No se pudo borrar en backend: {e}")
-                    st.session_state.conversations.pop(cid, None)
-                    if st.session_state.active_conversation_id == cid:
-                        st.session_state.active_conversation_id = next(
-                            iter(st.session_state.conversations), None
-                        )
-                    st.rerun()
+# ----------------------------
+# Main: Chat
+# ----------------------------
+if st.session_state.page == "Chat":
+    col_left, col_right = st.columns([0.36, 0.64], gap="large")
 
-            export_md = st.button("📥 Exportar chat (MD)", key=f"exp_md_{cid}")
-            if export_md:
-                r = requests.get(
-                    f"{BACKEND_URL}/conversations/{cid}/export",
-                    params={"format": "markdown"},
-                    timeout=30,
-                )
-                if r.status_code == 200:
-                    st.download_button(
-                        "⬇️ Descargar conversación (.md)",
-                        data=r.content,
-                        file_name=f"conversation_{cid}.md",
-                        mime="text/markdown",
-                        key=f"dl_md_{cid}",
-                    )
-                else:
-                    st.error(f"No se pudo exportar la conversación ({r.status_code})")
-    # ==================================
-    # 💬 Columna DERECHA: chat actual
-    # ==================================
-    with chat_col:
-        conv = get_active_conversation()
-        if conv is None:
-            st.warning("Selecciona o crea una conversación en la izquierda.")
+    with col_left:
+        st.header("Chat asistente")
+        st.subheader("Conversaciones")
+
+        # load conversations
+        try:
+            convs = fetch_conversations()
+        except Exception as e:
+            st.error(f"No se pudieron cargar conversaciones: {e}")
             st.stop()
 
-        exp_col1, exp_col2 = st.columns(2)
-        with exp_col1:
-            if st.button("📥 Exportar chat (Markdown)"):
-                try:
-                    r = requests.get(
-                        f"{BACKEND_URL}/conversations/{conv['id']}/export",
-                        params={"format": "markdown"},
-                        timeout=15,
-                    )
-                    r.raise_for_status()
-                    md_bytes = r.content
-                    st.download_button(
-                        "⬇️ Descargar conversación.md",
-                        data=md_bytes,
-                        file_name=f"conversation_{conv['id']}.md",
-                        mime="text/markdown",
-                        key=f"export_md_{conv['id']}",
-                    )
-                except Exception as e:
-                    st.error(f"No se pudo exportar la conversación: {e}")
+        # button new conversation
+        if st.button("Nueva conversación", use_container_width=True):
+            try:
+                newc = create_conversation()
+                st.session_state.selected_conv_id = newc["id"]
+                st.session_state.conv_detail = fetch_conversation_detail(newc["id"])
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo crear: {e}")
 
-        with exp_col2:
-            if st.button("📥 Exportar chat (JSON)"):
-                try:
-                    r = requests.get(
-                        f"{BACKEND_URL}/conversations/{conv['id']}/export",
-                        params={"format": "json"},
-                        timeout=15,
-                    )
-                    r.raise_for_status()
-                    json_bytes = r.content
-                    st.download_button(
-                        "⬇️ Descargar conversación.json",
-                        data=json_bytes,
-                        file_name=f"conversation_{conv['id']}.json",
-                        mime="application/json",
-                        key=f"export_json_{conv['id']}",
-                    )
-                except Exception as e:
-                    st.error(f"No se pudo exportar la conversación: {e}")
+        # select conversation
+        conv_options = [(c["id"], c.get("title") or str(c["id"])) for c in convs]
+        if not conv_options:
+            st.info("No hay conversaciones todavía.")
+        else:
+            id_to_label = {cid: label for cid, label in conv_options}
+            default_idx = 0
+            if st.session_state.selected_conv_id in id_to_label:
+                default_idx = [cid for cid, _ in conv_options].index(st.session_state.selected_conv_id)
 
-        # -------- Configuración de RAG por conversación --------
-        with st.expander("⚙️ Configuración de la consulta (solo esta conversación)", expanded=True):
-            col1, col2 = st.columns([2, 1])
-
-            with col1:
-                scope = st.radio(
-                    "Ámbito de búsqueda",
-                    ["Todos los documentos", "Seleccionar documentos"],
-                    horizontal=True,
-                    index=0 if conv["scope"] == "Todos" else 1,
-                    key=f"scope_{conv['id']}",
-                )
-                conv["scope"] = "Todos" if scope == "Todos los documentos" else "Seleccionar"
-
-            with col2:
-                top_k = st.slider(
-                    "top_k (nº de chunks)",
-                    min_value=3,
-                    max_value=30,
-                    value=10,
-                    key=f"topk_{conv['id']}",
-                )
-
-            selected_doc_ids = None
-            if scope == "Seleccionar documentos" and doc_options:
-                labels = list(doc_options.keys())
-                # Valores por defecto recuperados de la conversación
-                current_doc_ids = conv.get("doc_ids") or []
-                default_labels = [
-                    label for label, did in doc_options.items() if did in current_doc_ids
-                ]
-
-                selected_labels = st.multiselect(
-                    "Elige documentos para esta conversación",
-                    labels,
-                    default=default_labels,
-                    placeholder="Selecciona uno o varios PDFs",
-                    key=f"docs_{conv['id']}",
-                )
-                selected_doc_ids = [doc_options[l] for l in selected_labels]
-                conv["doc_ids"] = selected_doc_ids or None
-            else:
-                selected_doc_ids = None
-                conv["doc_ids"] = None
-
-        st.markdown("---")
-        with chat_col:
-            conv = get_active_conversation()
-            if not conv:
-                st.info("No hay conversación activa. Crea una conversación nueva en la columna izquierda.")
-                st.stop()
-
-            st.markdown(f"### 🧵 {conv['title']}")
-
-            exp_col1, exp_col2 = st.columns(2)
-            with exp_col1:
-                if st.button("📥 Exportar como JSON"):
-                    try:
-                        r = requests.get(
-                            f"{BACKEND_URL}/conversations/{conv['id']}/export",
-                            params={"format": "json"},
-                            timeout=15,
-                        )
-                        r.raise_for_status()
-                        st.download_button(
-                            "⬇️ Descargar JSON",
-                            data=r.content,
-                            file_name=f"conversation_{conv['id']}.json",
-                            mime="application/json",
-                        )
-                    except Exception as e:
-                        st.error(f"Error exportando conversación: {e}")
-
-            with exp_col2:
-                if st.button("📄 Exportar como Markdown"):
-                    try:
-                        r = requests.get(
-                            f"{BACKEND_URL}/conversations/{conv['id']}/export",
-                            params={"format": "markdown"},
-                            timeout=15,
-                        )
-                        r.raise_for_status()
-                        st.download_button(
-                            "⬇️ Descargar Markdown",
-                            data=r.content,
-                            file_name=f"conversation_{conv['id']}.md",
-                            mime="text/markdown",
-                        )
-                    except Exception as e:
-                        st.error(f"Error exportando conversación: {e}")
-        # -------- Historial de mensajes --------
-        messages = conv["messages"]
-        
-        # Índice de la última respuesta del asistente
-        last_assistant_idx = None
-        for i, m in enumerate(messages):
-            if m["role"] == "assistant":
-                last_assistant_idx = i
-
-        for idx, msg in enumerate(messages):
-            role = msg["role"]
-            content = msg["content"]
-            tables = msg.get("tables", [])
-            images = msg.get("images", [])
-
-            with st.chat_message("user" if role == "user" else "assistant"):
-                st.markdown(content)
-
-                # Solo mostrar tablas / imágenes de LA ÚLTIMA respuesta del asistente
-                if role == "assistant" and last_assistant_idx is not None and idx == last_assistant_idx:
-                    for t_i, csv_path in enumerate(tables):
-                        st.markdown("**📊 Tabla relacionada:**")
-                        render_table_from_csv_path(
-                            csv_path,
-                            key_suffix=f"hist_msg{idx}_tbl{t_i}",
-                        )
-
-                    for im_i, image_path in enumerate(images):
-                        st.markdown("**🖼 Imagen relacionada:**")
-                        render_image_from_path(
-                            image_path,
-                            key_suffix=f"hist_msg{idx}_img{im_i}",
-                        )
-
-        # -------- Entrada del usuario --------
-        user_input = st.chat_input("Escribe tu pregunta al asistente...")
-
-        if user_input:
-            # 1) Añadir mensaje de usuario
-            user_msg = {
-                "role": "user",
-                "content": user_input,
-                "tables": [],
-                "images": [],
-            }
-            messages.append(user_msg)
-
-            # 2) Preparar historial simple para el backend
-            history = [
-                {"role": m["role"], "content": m["content"]}
-                for m in messages
-                if m["role"] in ("user", "assistant")
-            ]
-            q_lower = user_input.lower()
-
-            only_flag = any(
-                w in q_lower
-                for w in ["solo", "sólo", "unicamente", "únicamente", "only", "just"]
+            selected_label = st.selectbox(
+                "Selecciona conversación",
+                options=[id_to_label[cid] for cid, _ in conv_options],
+                index=default_idx,
             )
-            wants_table = any(w in q_lower for w in ["tabla", "table"])
-            wants_image = any(
-                w in q_lower for w in ["imagen", "image", "figura", "gráfico", "grafico"]
+            selected_cid = [cid for cid, label in conv_options if label == selected_label][0]
+
+            if selected_cid != st.session_state.selected_conv_id or st.session_state.conv_detail is None:
+                st.session_state.selected_conv_id = selected_cid
+                try:
+                    st.session_state.conv_detail = fetch_conversation_detail(selected_cid)
+                except Exception as e:
+                    st.error(f"No se pudo cargar conversación: {e}")
+                    st.session_state.conv_detail = None
+
+        conv_detail = st.session_state.conv_detail
+
+        st.subheader("Título")
+        if conv_detail:
+            new_title = st.text_input("Título", value=conv_detail.get("title", ""))
+            if st.button("Guardar título", use_container_width=True):
+                try:
+                    update_conversation_title(conv_detail["id"], new_title)
+                    st.session_state.conv_detail = fetch_conversation_detail(conv_detail["id"])
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar título: {e}")
+
+        st.subheader("Exportar (UI)")
+        if conv_detail:
+            md = conversation_to_markdown(conv_detail)
+            st.download_button(
+                "Descargar Markdown",
+                data=md.encode("utf-8"),
+                file_name=f"conversation_{conv_detail['id']}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Descargar JSON",
+                data=str(conv_detail).encode("utf-8"),
+                file_name=f"conversation_{conv_detail['id']}.json",
+                mime="application/json",
+                use_container_width=True,
             )
 
-            if only_flag and wants_table and not wants_image:
-                allowed_modalities = {"table"}
-            elif only_flag and wants_image and not wants_table:
-                allowed_modalities = {"image"}
-            else:
-                # Caso general: mostramos todo lo relevante
-                allowed_modalities = {"text", "table", "image"}
-            # 3) Llamar a /ask
-            with st.chat_message("assistant"):
-                with st.spinner("Consultando al backend RAG…"):
-                    payload = {
-                        "question": user_input,
-                        "top_k": top_k,
-                        "doc_ids": selected_doc_ids or conv["doc_ids"],
-                        "history": history,
-                    }
+        st.subheader("Borrar conversación")
+        if conv_detail:
+            if st.button("Borrar conversación", type="primary", use_container_width=True):
+                try:
+                    delete_conversation(conv_detail["id"])
+                    st.session_state.selected_conv_id = None
+                    st.session_state.conv_detail = None
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo borrar: {e}")
 
-                    try:
-                        resp = requests.post(
-                            f"{BACKEND_URL}/ask",
-                            json=payload,
-                            timeout=120,
-                        )
-                    except Exception as e:
-                        st.error(f"❌ Error conectando a /ask: {e}")
-                        st.stop()
+        st.divider()
+        st.subheader("Contexto (documentos)")
+        st.session_state.auto_show_attachments = st.checkbox(
+            "Mostrar tablas/imágenes automáticamente (si el RAG las devuelve)",
+            value=st.session_state.auto_show_attachments,
+        )
+        st.session_state.top_k = st.slider("top_k", 1, 20, int(st.session_state.top_k))
 
-                    if resp.status_code != 200:
-                        st.error(f"❌ Error {resp.status_code}")
+        docs = []
+        try:
+            docs = fetch_documents()
+        except Exception:
+            pass
+
+        scope = st.radio("Ámbito", ["Todos", "Seleccionar"], index=0 if st.session_state.doc_scope == "all" else 1)
+        st.session_state.doc_scope = "all" if scope == "Todos" else "selected"
+
+        if st.session_state.doc_scope == "selected":
+            options = [(d["id"], d.get("original_filename") or d.get("storage_key_original") or str(d["id"])) for d in docs]
+            labels = [f"{name} ({did})" for did, name in options]
+            selected = st.multiselect("Documentos", options=labels, default=[])
+            selected_ids = []
+            for lab in selected:
+                # extrae id entre paréntesis final
+                try:
+                    did = lab.split("(")[-1].rstrip(")")
+                    selected_ids.append(did)
+                except Exception:
+                    continue
+            st.session_state.selected_doc_ids = selected_ids
+        else:
+            st.session_state.selected_doc_ids = []
+
+    # ----------------------------
+    # Right: chat rendering + input
+    # ----------------------------
+    with col_right:
+        st.subheader("Conversación")
+
+        if not conv_detail:
+            st.info("Crea o selecciona una conversación.")
+        else:
+            msgs = dedup_messages(conv_detail.get("messages", []))
+
+            # Render history
+            for i, msg in enumerate(msgs):
+                role = msg.get("role", "assistant")
+                content = msg.get("content", "")
+                with st.chat_message(role):
+                    st.markdown(content)
+
+                    ex = safe_get_extra(msg)
+                    tables = ex.get("tables") or []
+                    images = ex.get("images") or []
+
+                    if tables or images:
+                        with st.expander("Adjuntos", expanded=False):
+                            if tables:
+                                st.markdown("**Tablas**")
+                                for t_idx, csv_key in enumerate(tables):
+                                    st.markdown(f"- `{csv_key}`")
+                                    render_table_attachment(csv_key, key_prefix=f"msg{i}_tbl{t_idx}")
+                                    st.divider()
+                            if images:
+                                st.markdown("**Imágenes**")
+                                for im_idx, img_key in enumerate(images):
+                                    st.markdown(f"- `{img_key}`")
+                                    render_image_attachment(img_key, key_prefix=f"msg{i}_img{im_idx}")
+                                    st.divider()
+
+            # Chat input
+            user_text = st.chat_input("Escribe tu mensaje…")
+
+            if user_text:
+                cid = conv_detail["id"]
+
+                # Render user message optimista (solo visual)
+                with st.chat_message("user"):
+                    st.markdown(user_text)
+
+                # 1) Persist user message en backend (una sola vez)
+                try:
+                    add_message(cid, "user", user_text, extra={})
+                except Exception as e:
+                    st.error(f"No se pudo guardar el mensaje del usuario: {e}")
+                    st.stop()
+
+                # 2) Llamar RAG
+                # refresca una vez para history consistente (opcional)
+                try:
+                    fresh = fetch_conversation_detail(cid)
+                    base_msgs = dedup_messages(fresh.get("messages", []))
+                except Exception:
+                    base_msgs = msgs
+
+                history = build_history_for_rag(base_msgs, max_turns=12)
+
+                doc_ids = st.session_state.selected_doc_ids if st.session_state.doc_scope == "selected" else []
+                top_k = int(st.session_state.top_k)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("Generando respuesta…"):
                         try:
-                            st.json(resp.json())
-                        except Exception:
-                            st.text(resp.text)
-                        st.stop()
+                            rag = rag_ask(user_text, history=history, doc_ids=doc_ids, top_k=top_k)
+                        except Exception as e:
+                            st.error(f"Error llamando a /rag/ask/: {e}")
+                            st.stop()
 
-                    data = resp.json()
-                    answer = data.get("answer", "(sin respuesta)")
-                    raw_context = data.get("context", [])
+                        answer = rag.get("answer", "(sin respuesta)")
+                        st.markdown(answer)
 
-                    q_lower = user_input.lower()
+                        # 3) Extraer artefactos
+                        table_paths, image_paths = extract_artifacts_from_rag(rag)
 
-                    wants_table = any(w in q_lower for w in ["tabla", "tablas", "table", "cuadro"])
-                    wants_image = any(w in q_lower for w in ["imagen", "imágenes", "imagen", "figura", "foto", "gráfico", "grafico"])
-                    
-                    context = raw_context
-                    if wants_table and not wants_image:
-                        # Solo mostramos tablas
-                        context = [
-                            c for c in raw_context
-                            if (c.get("metadata", {}) or {}).get("modality") == "table"
-                        ]
-                    elif wants_image and not wants_table:
-                        # Solo mostramos imágenes
-                        context = [
-                            c for c in raw_context
-                            if (c.get("metadata", {}) or {}).get("modality") == "image"
-                        ]
-                    # 4) Determinar tablas e imágenes usadas
-                    tables_to_show: list[str] = []
-                    images_to_show: list[str] = []
+                        # Control de auto-mostrar
+                        wants_table, wants_image = wants_tables_or_images(user_text)
+                        should_show = st.session_state.auto_show_attachments or wants_table or wants_image
 
-                    for c in context:
-                        meta = c.get("metadata", {}) or {}
-                        modality = meta.get("modality", "text")
+                        if should_show and (table_paths or image_paths):
+                            with st.expander("Adjuntos", expanded=True):
+                                if table_paths:
+                                    st.markdown("**Tablas**")
+                                    for t_idx, csv_key in enumerate(table_paths):
+                                        st.markdown(f"- `{csv_key}`")
+                                        render_table_attachment(csv_key, key_prefix=f"cur_tbl{t_idx}")
+                                        st.divider()
+                                if image_paths:
+                                    st.markdown("**Imágenes**")
+                                    for im_idx, img_key in enumerate(image_paths):
+                                        st.markdown(f"- `{img_key}`")
+                                        render_image_attachment(img_key, key_prefix=f"cur_img{im_idx}")
+                                        st.divider()
 
-                        if modality not in allowed_modalities:
-                            continue
-                        if modality == "table":
-                            table_meta = meta.get("table")  # headers + rows
-                            csv_path = meta.get("csv_path")
-                            tables_to_show.append(
-                                {
-                                    "csv_path": csv_path,
-                                    "table": table_meta,
-                                }
-                            )
-
-                        if modality == "image":
-                            image_path = meta.get("image_path")
-                            if image_path and image_path not in images_to_show:
-                                images_to_show.append(image_path)
-                    
-                    def dedup_paths(items, meta_key: str | None = None):
-                        """
-                        items: lista de strings o dicts.
-                        meta_key:
-                        - "csv_path" para tablas
-                        - "image_path" para imágenes
-                        Devuelve siempre una lista de strings (los paths únicos).
-                        """
-                        seen = set()
-                        out: list[str] = []
-
-                        for x in items:
-                            if isinstance(x, dict) and meta_key:
-                                path = x.get(meta_key)
-                            else:
-                                path = x
-
-                            if not path:
-                                continue
-
-                            if path not in seen:
-                                seen.add(path)
-                                out.append(path)
-
-                        return out
-
-                    tables_to_show = dedup_paths(tables_to_show, meta_key="csv_path")
-                    images_to_show = dedup_paths(images_to_show, meta_key="image_path")
-
-
-                    # 5) Pintar respuesta + adjuntos (SOLO de esta respuesta)
-                    st.markdown(answer)
-
-                    for t_i, csv_path in enumerate(tables_to_show):
-                        st.markdown("**📊 Tabla relacionada:**")
-                        render_table_from_csv_path(
-                            csv_path,
-                            key_suffix=f"current_tbl{t_i}",
-                        )
-
-                    for im_i, image_path in enumerate(images_to_show):
-                        st.markdown("**🖼 Imagen relacionada:**")
-                        render_image_from_path(
-                            image_path,
-                            key_suffix=f"current_img{im_i}",
-                        )
-
-            # 6) Guardar mensaje de asistente en la conversación
-            assistant_msg = {
-                "role": "assistant",
-                "content": answer,
-                "tables": tables_to_show,
-                "images": images_to_show,
-            }
-            messages.append(assistant_msg)
-
-            # 7) Actualizar título de la conversación con el primer mensaje
-            if conv["title"] == "Nueva conversación" or conv["title"].startswith("Conversación"):
-                conv["title"] = user_input[:40] + ("…" if len(user_input) > 40 else "")
-
-            # 8) Persistir la conversación en el backend (si hay id)
-            conv_backend_id = conv.get("id")
-            if conv_backend_id:
-                new_messages = [user_msg, assistant_msg]
-
-                payload_update = {
-                    "new_messages": new_messages,
-                    "scope": conv.get("scope"),
-                    "doc_ids": conv.get("doc_ids"),
-                    "title": conv.get("title"),
-                }
-
+                # 4) Persist assistant message con extra (IMPORTANTÍSIMO)
                 try:
-                    requests.put(
-                        f"{BACKEND_URL}/conversations/{conv_backend_id}",
-                        json=payload_update,
-                        timeout=10,
+                    add_message(
+                        cid,
+                        "assistant",
+                        answer,
+                        extra={"tables": table_paths, "images": image_paths},
                     )
                 except Exception as e:
-                    st.warning(f"⚠️ No se ha podido guardar la conversación en backend: {e}")
+                    st.warning(f"No se pudo guardar el mensaje del asistente: {e}")
 
-            # 9) Rerun para refrescar la UI
-            st.rerun()
+                # 5) Rerun: recarga conversación desde backend (evita duplicados)
+                try:
+                    st.session_state.conv_detail = fetch_conversation_detail(cid)
+                except Exception:
+                    st.session_state.conv_detail = None
+                st.rerun()
+
 
 # ----------------------------
-# 📂 Página: Documentos
+# Main: Documentos
 # ----------------------------
-elif page == "📂 Documentos":
-    st.markdown("## 📂 Documentos")
+else:
+    st.header("Documentos")
 
-    docs = fetch_documents()
+    col_a, col_b = st.columns([0.55, 0.45], gap="large")
 
-    col_list, col_ingest = st.columns([2, 1])
-
-    with col_list:
-        st.markdown("### Lista de documentos")
+    with col_a:
+        st.subheader("Listado de documentos")
+        try:
+            docs = fetch_documents()
+        except Exception as e:
+            st.error(f"No se pudieron cargar documentos: {e}")
+            docs = []
 
         if not docs:
-            st.info("No hay documentos ingestado(s) todavía.")
+            st.info("No hay documentos.")
         else:
-            df_docs = pd.DataFrame(docs)
-            st.dataframe(df_docs, use_container_width=True)
-
-            st.markdown("#### Acciones por documento")
-
             for d in docs:
-                doc_id = d["doc_id"]
-                pdf_path = d.get("pdf_path", "")
-                size = d.get("size", 0)
+                doc_id = d.get("id")
+                name = d.get("original_filename") or d.get("storage_key_original") or str(doc_id)
+                status_ = d.get("status")
 
-                cols = st.columns([4, 1, 1])
-                name = d.get("original_filename") or doc_id
-                with cols[0]:
-                    st.markdown(
-                        f"**📄 {name}**  \n"
-                        f"- doc_id: `{doc_id}`  \n"
-                        f"- pdf_path: `{pdf_path}`  \n"
-                        f"- Tamaño: **{size} bytes**"
-                    )
-                with cols[1]:
-                    if st.button("🗑 Borrar", key=f"del_{doc_id}"):
+                st.markdown(f"### {name}")
+                st.caption(f"id: {doc_id} · status: {status_}")
+
+                c1, c2, c3 = st.columns([0.18, 0.18, 0.18])
+                with c1:
+                    if st.button("Ver status", key=f"st_{doc_id}"):
+                        st.json(d)
+
+                with c2:
+                    if st.button("Reindex", key=f"rx_{doc_id}"):
                         try:
-                            r = requests.delete(
-                                f"{BACKEND_URL}/documents/{doc_id}", timeout=120
-                            )
-                            if r.status_code == 200:
-                                st.success(f"Documento {doc_id} borrado.")
-                                st.rerun()
-                            else:
-                                st.error(f"Error borrando {doc_id}: {r.status_code}")
+                            out = reindex_document(str(doc_id))
+                            st.success(out)
                         except Exception as e:
-                            st.error(f"Error llamando a delete: {e}")
-                with cols[2]:
-                    if st.button("🔄 Reindexar", key=f"re_{doc_id}"):
+                            st.error(f"Error reindex: {e}")
+
+                with c3:
+                    if st.button("Eliminar", key=f"del_{doc_id}"):
                         try:
-                            r = requests.post(
-                                f"{BACKEND_URL}/documents/{doc_id}/reindex",
-                                timeout=300,
-                            )
-                            if r.status_code == 200:
-                                st.success(f"Documento {doc_id} reindexado.")
-                                st.json(r.json())
-                            else:
-                                st.error(f"Error reindexando {doc_id}: {r.status_code}")
+                            delete_document(str(doc_id))
+                            st.success("Eliminado")
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Error llamando a reindex: {e}")
+                            st.error(f"Error delete: {e}")
 
-    with col_ingest:
-        st.markdown("### ➕ Ingestar nuevo PDF")
+                st.divider()
 
-        upl = st.file_uploader("Sube un PDF", type=["pdf"], key="upl_docs")
-
-        if upl and st.button("Ingestar PDF", type="primary"):
-            with st.spinner("Procesando PDF... ⏳"):
-                files = {"file": (upl.name, upl.getvalue(), "application/pdf")}
+    with col_b:
+        st.subheader("Ingestar PDF")
+        up = st.file_uploader("Sube un PDF", type=["pdf"])
+        if up is not None:
+            if st.button("Ingestar PDF", type="primary", use_container_width=True):
                 try:
-                    resp = requests.post(
-                        f"{BACKEND_URL}/ingest", files=files, timeout=120
-                    )
-                    if resp.status_code != 200:
-                        st.error(f"❌ Error {resp.status_code}")
-                        st.text(resp.text)
-                    else:
-                        st.success("✅ PDF procesado correctamente")
-                        st.json(resp.json())
-                        st.rerun()
+                    out = ingest_document(up.read(), up.name)
+                    st.success(out)
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Error enviando PDF: {e}")
+                    st.error(f"Error ingest: {e}")

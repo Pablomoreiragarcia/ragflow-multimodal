@@ -59,7 +59,7 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
     pages = extract_text_from_pdf(pdf_bytes)
     images = extract_images_from_pdf(doc_id, pdf_bytes)
     tables = extract_tables_from_pdf(pdf_bytes)
-
+    created_assets = []
 
     # ------------------------------
     # 🔹 Imágenes
@@ -67,27 +67,29 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
     image_points = []
     for img in images:
         raw = img.get("bytes")
-
-        # 1) Si no son bytes, NO es una imagen. Saltamos.
         if not isinstance(raw, (bytes, bytearray)):
-            logger.warning("[PDF_INGEST] Skip image: bytes is %s", type(raw).__name__)
             continue
 
-        # 2) Intentar decodificar como imagen real (PNG/JPG/etc.)
-        #try:
-        #    pil = Image.open(BytesIO(raw)).convert("RGB")
-        #except Exception as e:
-        #    logger.warning("[PDF_INGEST] Skip image: cannot decode image bytes (%s)", e)
-        #    continue
-
-        # 3) Embedding CLIP con PIL (NO con bytes)
         try:
-            vec = embed_image(img["bytes"])  # 512 dims
+            vec = embed_image(img["bytes"])
             if vec is None:
                 continue
-        except Exception as e:
-            logger.warning("[PDF_INGEST] Skip image: CLIP encode failed (%s)", e)
+        except Exception:
             continue
+
+        page_1based = (img.get("page", 0) + 1) if isinstance(img.get("page"), int) else img.get("page")
+        image_path = img.get("image_path")
+
+        # Guardamos asset para BBDD (si existe path)
+        if image_path:
+            created_assets.append({
+                "type": "image",
+                "page": page_1based,
+                "storage_key": image_path,
+                "meta": {
+                    "content": img.get("content", ""),
+                },
+            })
 
         image_points.append(
             PointStruct(
@@ -97,9 +99,9 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
                     "content": img.get("content", ""),
                     "metadata": {
                         "doc_id": doc_id,
-                        "page": (img.get("page", 0) + 1) if isinstance(img.get("page"), int) else img.get("page"),
+                        "page": page_1based,
                         "modality": "image",
-                        "image_path": img.get("image_path"),
+                        "image_path": image_path,
                     },
                 },
             )
@@ -133,15 +135,16 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
 
     if all_chunks:
         vectors = embed_texts([c["content"] for c in all_chunks])
-
         for c, v in zip(all_chunks, vectors):
             c["embedding"] = v
-
         add_text_chunks(all_chunks)
+
+
 
     # ------------------------------
     # 🔹 Tablas
     # ------------------------------
+
     table_rows = []
     row_id = 0
 
@@ -151,31 +154,31 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
         table_idx = table.get("idx", 0)
 
         if df.empty:
-            logger.warning(
-                "[PDF_INGEST] Tabla %d en página %d está vacía, no se guarda CSV.",
-                table_idx, page_num
-            )
+            logger.warning("[PDF_INGEST] Tabla %d en página %d está vacía, no se guarda CSV.", table_idx, page_num)
             continue
 
-        # Guardar CSV completo en MinIO (con headers correctos)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         csv_path = f"{doc_id}/tables/table_{page_num}_table_{table_idx}.csv"
-        logger.info(
-            "[PDF_INGEST] CSV para %s tiene %d bytes",
-            csv_path,
-            len(csv_bytes)
-        )
-        upload_bytes(csv_path, csv_bytes)
-        logger.info(f"[PDF_INGEST] Guardando tabla {table_idx} de página {page_num} en {csv_path}")
-        logger.info("[PDF_INGEST] Tabla %d head():\n%s" % (table_idx, df.head()))
+        upload_bytes(csv_path, csv_bytes, "text/csv")
 
         headers = list(df.columns)
         rows = df.values.tolist()
 
+        # Asset para BBDD (tabla completa)
+        created_assets.append({
+            "type": "table",
+            "page": page_num + 1,
+            "storage_key": csv_path,
+            "meta": {
+                "idx": table_idx,
+                "rows": int(df.shape[0]),
+                "cols": int(df.shape[1]),
+                "headers": list(df.columns),
+            },
+        })
+
         for r in rows:
-            row_text_parts = []
-            for col_name, value in zip(headers, r):
-                row_text_parts.append(f"{col_name}: {value}")
+            row_text_parts = [f"{col_name}: {value}" for col_name, value in zip(headers, r)]
             row_text = " | ".join(row_text_parts)
 
             table_rows.append(
@@ -198,12 +201,10 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
 
     if table_rows:
         vectors = embed_texts([r["content"] for r in table_rows])
-
         for r, v in zip(table_rows, vectors):
             r["embedding"] = v
-
         add_table_rows(table_rows, collection_name=TEXT_COLLECTION, embedding_key="embedding")
-    
+
     result = {
         "status": "ok",
         "doc_id": doc_id,
@@ -211,12 +212,13 @@ def process_pdf(pdf_bytes: bytes, original_filename: str | None = None, doc_id: 
         "pdf_path": pdf_path,
         "pages": len(pages),
         "num_text_chunks": len(all_chunks),
-        "num_tables": len(tables),
-        "num_images": len(image_points),
+        "num_tables": len([a for a in created_assets if a["type"] == "table"]),
+        "num_images": len([a for a in created_assets if a["type"] == "image"]),
+        "assets": created_assets,  # <-- NUEVO
         "created_at": datetime.utcnow().isoformat()
     }
 
     meta_key = f"docs_meta/{doc_id}.json"
-    upload_bytes(meta_key, json.dumps(result, ensure_ascii=False).encode("utf-8"))
+    upload_bytes(meta_key, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json")
 
     return result

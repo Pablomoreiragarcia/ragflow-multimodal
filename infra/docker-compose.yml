@@ -1,16 +1,50 @@
 services:
-  ui:
-    build:
-      context: ../ui
-    container_name: ui
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
     ports:
-      - "8501:8501"
-    depends_on:
-      - backend_django
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     environment:
-      - BACKEND_URL=http://backend_django:8000
-
-
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ragflow
+      POSTGRES_USER: ragflow
+      POSTGRES_PASSWORD: ragflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragflow -d ragflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
   minio_create_buckets:
       image: minio/mc:latest
       depends_on:
@@ -41,7 +75,12 @@ services:
       dockerfile: Dockerfile.web
     env_file:
       - ../backend_django/.env
-    command: ["python", "manage.py", "migrate", "--noinput"]
+    command:
+      - sh
+      - -lc
+      - |
+        python manage.py makemigrations --noinput || true
+        python manage.py migrate --noinput
     volumes:
       - ../backend_django:/app
       - hf_cache:/app/.cache
@@ -60,6 +99,10 @@ services:
       context: ../backend_django
       dockerfile: Dockerfile.web
     container_name: backend_django
+    networks:
+      default:
+        aliases:
+          - backenddjango
     env_file:
       - ../backend_django/.env
     ports:
@@ -79,6 +122,12 @@ services:
         condition: service_started
       redis:
         condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      init_vectorstores:
+        condition: service_completed_successfully
+      minio_create_buckets:
+        condition: service_completed_successfully
     environment:
       QDRANT_URL: http://qdrant:6333
       MINIO_ENDPOINT: minio:9000
@@ -138,55 +187,25 @@ services:
       HF_HOME: /app/.cache/huggingface
       TRANSFORMERS_CACHE: /app/.cache/huggingface/transformers
       SENTENCE_TRANSFORMERS_HOME: /app/.cache/sentence-transformers
-  redis:
-    image: redis:7-alpine
-    container_name: redis
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.dev
+    container_name: frontend
     ports:
-      - "6379:6379"
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "3000:3000"
+    depends_on:
+      - backend_django
+      - celery_worker
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      - BACKEND_INTERNAL_ORIGIN=http://backenddjango:8000
     volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-  postgres:
-    image: postgres:16-alpine
-    container_name: postgres
-    environment:
-      POSTGRES_DB: ragflow
-      POSTGRES_USER: ragflow
-      POSTGRES_PASSWORD: ragflow
-    ports:
-      - "5433:5432"
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ragflow -d ragflow"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      - ../frontend:/app
+      - frontend_node_modules:/app/node_modules
 
 volumes:
   pg_data:
   hf_cache:
   qdrant_data:
   minio_data:
+  frontend_node_modules:

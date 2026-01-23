@@ -1,6 +1,7 @@
 Django==5.2.9
 djangorestframework
 django-extensions
+django-cors-headers
 python-dotenv
 psycopg[binary]
 
