@@ -1,6 +1,6 @@
 # app/llm/chat.py
 import base64
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple, Any
 from openai import OpenAI
 import os
 import imghdr
@@ -51,7 +51,7 @@ def call_llm(
     image_titles: Optional[List[str]] = None,
     attachments_catalog: Optional[str] = None,
     max_images: int = IMAGES_LIMIT,
-) -> str:
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     Llama a un modelo multimodal (texto + imagen) para responder
     usando:
@@ -126,4 +126,7 @@ def call_llm(
         temperature=0.2,
     )
 
-    return completion.choices[0].message.content or ""
+    text = completion.choices[0].message.content or ""
+    usage = getattr(completion, "usage", None)
+
+    return text, (usage.model_dump() if usage else None)

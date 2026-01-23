@@ -3,7 +3,6 @@ import uuid
 from django.db import models
 from django.utils import timezone
 
-
 class Conversation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -68,3 +67,47 @@ class Message(models.Model):
 
     def __str__(self) -> str:
         return f"{self.role}: {self.content[:40]}"
+
+
+class RagRequestLog(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    conversation_id = models.UUIDField(null=True, blank=True)
+    client_message_id = models.CharField(max_length=64, null=True, blank=True)
+
+    model_requested = models.CharField(max_length=128, null=True, blank=True)
+    model_used = models.CharField(max_length=128, null=True, blank=True)
+    fallback_reason = models.CharField(max_length=256, null=True, blank=True)
+
+    prompt_tokens = models.IntegerField(null=True, blank=True)
+    completion_tokens = models.IntegerField(null=True, blank=True)
+    total_tokens = models.IntegerField(null=True, blank=True)
+
+    ok = models.BooleanField(default=True)
+    status_code = models.IntegerField(default=200)
+    error_type = models.CharField(max_length=128, null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+
+    # tiempos (ms) si ya los estás midiendo o los añades ahora
+    embed_ms = models.IntegerField(default=0)
+    qdrant_ms = models.IntegerField(default=0)
+    minio_ms = models.IntegerField(default=0)
+    llm_ms = models.IntegerField(default=0)
+    total_ms = models.IntegerField(default=0)
+
+    api_pre_rag_ms = models.IntegerField(default=0)
+    api_post_rag_ms = models.IntegerField(default=0)
+    api_total_ms = models.IntegerField(default=0)
+    db_ms = models.IntegerField(default=0)
+
+    attachments_total = models.IntegerField(default=0)
+    attachments_images = models.IntegerField(default=0)
+    attachments_tables = models.IntegerField(default=0)
+    class Meta:
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["conversation_id", "created_at"]),
+            models.Index(fields=["ok", "created_at"]),
+            models.Index(fields=["model_used", "created_at"]),
+        ]

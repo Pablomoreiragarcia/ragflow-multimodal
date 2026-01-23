@@ -29,6 +29,10 @@ import csv
 import io
 import hashlib
 
+from .observability import normalize_usage
+from rag.models import RagRequestLog
+import time
+
 IMAGES_LIMIT = int(os.getenv("IMAGES_LIMIT"))
 TABLES_LIMIT = int(os.getenv("TABLES_LIMIT"))
 TABLE_PREVIEW_ROWS = int(os.getenv("TABLE_PREVIEW_ROWS"))
@@ -169,7 +173,7 @@ def _table_signature(csv_bytes: bytes) -> str:
 
     return hashlib.sha256(canon).hexdigest()
 
-def dedup_table_assets_by_content(table_assets: list[dict]) -> tuple[list[dict], list[dict]]:
+def dedup_table_assets_by_content(table_assets: list[dict], downloader=download_bytes) -> tuple[list[dict], list[dict]]:
     """
     Input: [{"path":..., "title":...}, ...]
     Output:
@@ -179,7 +183,7 @@ def dedup_table_assets_by_content(table_assets: list[dict]) -> tuple[list[dict],
     groups: dict[str, list[dict]] = {}
     for t in table_assets:
         try:
-            b = download_bytes(t["path"])
+            b = downloader(t["path"])
             sig = _table_signature(b)
         except Exception:
             # si falla descarga, lo tratamos como único por path
@@ -250,6 +254,18 @@ def run_your_current_rag(
     - No persiste nada en BBDD. Eso lo hace el AskView (o quien llame).
     - `history` debe venir ya en formato [{"role":"user|assistant","content":"..."}].
     """
+    t_total0 = time.perf_counter()
+    timings = {"embed_ms": 0, "qdrant_ms": 0, "minio_ms": 0, "llm_ms": 0, "total_ms": 0}
+
+    def _ms(dt: float) -> int:
+        return int(round(dt * 1000))
+    
+    def download_bytes_timed(path: str) -> bytes:
+        t_dl = time.perf_counter()
+        b = download_bytes(path)
+        timings["minio_ms"] += _ms(time.perf_counter() - t_dl)
+        return b
+
     image_titles: List[str] = []
     q = (question or "").strip()
     if not q:
@@ -262,14 +278,18 @@ def run_your_current_rag(
     else:
         top_k_search = top_k_int
 
+    t0 = time.perf_counter()
     q_vec_text = embed_text(q)
-
+    timings["embed_ms"] += _ms(time.perf_counter() - t0)
+    
+    t0 = time.perf_counter()
     if doc_ids and len(doc_ids) > 1:
         hits = search_balanced_text_tables(q_vec_text, doc_ids, top_k_int)
         top_k_search = min(50, top_k_int * 2)  # si quieres recortar después
         hits = hits[:top_k_search]
     else:
         hits = search_text_and_tables(query_vector=q_vec_text, top_k=top_k_search, doc_ids=doc_ids)
+    timings["qdrant_ms"] += _ms(time.perf_counter() - t0)
 
     def dominant_doc_id_from_hits(hits) -> Optional[str]:
         scores = {}
@@ -362,8 +382,13 @@ def run_your_current_rag(
 
             for i, it in enumerate(img_assets, start=1):
                 try:
-                    image_bytes_list.append(download_bytes(it["path"]))
+                    t_dl = time.perf_counter()
+                    b = download_bytes(it["path"])
+                    timings["minio_ms"] += _ms(time.perf_counter() - t_dl)
+
+                    image_bytes_list.append(b)
                     image_titles.append(f"IMAGEN {i}: {it['title']}")
+
                 except Exception:
                     continue
             attachments_catalog_parts.append("IMÁGENES ADJUNTAS:\n" + "\n".join([t for t in image_titles]) if image_titles else "IMÁGENES ADJUNTAS:\n- (ninguna)")
@@ -374,15 +399,21 @@ def run_your_current_rag(
 
         else:
             # normal: 1 imagen por búsqueda semántica
+            t0 = time.perf_counter()
             q_vec_img = embed_image(q)
+            timings["embed_ms"] += _ms(time.perf_counter() - t0)
+            t0 = time.perf_counter()
             image_hits = search_images(query_vector=q_vec_img, top_k=1, doc_ids=doc_ids) or []
+            timings["qdrant_ms"] += _ms(time.perf_counter() - t0)
             if image_hits:
                 img_payload = getattr(image_hits[0], "payload", None) or {}
                 img_meta = (img_payload.get("metadata") or {}) if isinstance(img_payload, dict) else {}
                 first_image_path = img_meta.get("image_path") or img_payload.get("image_path")
                 if first_image_path:
                     try:
+                        t_dl = time.perf_counter()
                         image_bytes = download_bytes(first_image_path)
+                        timings["minio_ms"] += _ms(time.perf_counter() - t_dl)
                     except Exception:
                         image_bytes = None
 
@@ -390,7 +421,7 @@ def run_your_current_rag(
     dup_groups = []
     if doc_ids and allow_table and want_all_tables:
         tabs_all = list_assets_for_docs(doc_ids, kind="table", limit=30)
-        tabs_unique, dup_groups = dedup_table_assets_by_content(tabs_all)
+        tabs_unique, dup_groups = dedup_table_assets_by_content(tabs_all, downloader=download_bytes_timed)
 
         # limita tablas al LLM (por tokens)
         tabs_unique = tabs_unique[:max_tables_for_llm]
@@ -398,7 +429,10 @@ def run_your_current_rag(
         tab_lines = ["TABLAS (preview):"]
         for idx, t in enumerate(tabs_unique, start=1):
             try:
+                t_dl = time.perf_counter()
                 b = download_bytes(t["path"])
+                timings["minio_ms"] += _ms(time.perf_counter() - t_dl)
+
                 prev = _table_preview(b, max_rows=TABLE_PREVIEW_ROWS, max_chars=TABLE_PREVIEW_CHARS)
             except Exception:
                 prev = "(no se pudo leer el CSV)"
@@ -449,12 +483,15 @@ def run_your_current_rag(
     if "model" in params or accepts_kwargs:
         llm_kwargs["model"] = model
 
-    answer = call_llm(**llm_kwargs)
+    t0 = time.perf_counter()
+    answer, usage = call_llm(**llm_kwargs)
+    timings["llm_ms"] += _ms(time.perf_counter() - t0)
 
     out_table_path = first_table_path if (allow_table and first_table_path) else None
     out_image_path = first_image_path if (allow_image and first_image_path) else None
 
-    return answer, context_points, out_table_path, out_image_path
+    timings["total_ms"] = _ms(time.perf_counter() - t_total0)
+    return answer, context_points, out_table_path, out_image_path, usage, timings
 
 
 class ModelsView(APIView):
@@ -464,6 +501,18 @@ class ModelsView(APIView):
 
 class AskView(APIView):
     def post(self, request):
+        t_api0 = time.perf_counter()
+        timings_api = {"api_pre_rag_ms": 0, "api_post_rag_ms": 0, "api_total_ms": 0, "db_ms": 0}
+
+        def _ms(dt: float) -> int:
+            return int(round(dt * 1000))
+
+        def db_timed(fn):
+            t = time.perf_counter()
+            out = fn()
+            timings_api["db_ms"] += _ms(time.perf_counter() - t)
+            return out
+
         def sanitize_doc_ids(ids: list[str]) -> tuple[list[str], list[str]]:
             incoming = [str(x) for x in (ids or [])]
             if not incoming:
@@ -491,14 +540,14 @@ class AskView(APIView):
 
         # 1) Obtener o crear conversación
         if conv_id:
-            conv = Conversation.objects.get(id=conv_id, deleted=False)
+            conv = db_timed(lambda: Conversation.objects.get(id=conv_id, deleted=False))
         else:
-            conv = Conversation.objects.create(
+            conv = db_timed(lambda: Conversation.objects.create(
                 title="Nueva conversación",
                 scope="default",
                 top_k=top_k,
                 model=model or OPENAI_MODEL,
-            )
+            ))
 
         # 2) Persistir ajustes de conversación si cambian
         changed = False
@@ -538,12 +587,12 @@ class AskView(APIView):
         with transaction.atomic():
             # user message (si ya existe por constraint, no duplicamos)
             try:
-                Message.objects.create(
+                db_timed(lambda: Message.objects.create(
                     conversation=conv,
                     role=Message.ROLE_USER,
                     content=question,
                     client_message_id=client_message_id,
-                )
+                ))
             except IntegrityError:
                 pass
             
@@ -580,9 +629,10 @@ class AskView(APIView):
                         {"detail": "Some active documents are missing/not ready", "invalid_doc_ids": invalid},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
-
+                
+            timings_api["api_pre_rag_ms"] = _ms(time.perf_counter() - t_api0)
             # 3) Ejecutar RAG: si effective_doc_ids=None -> tu RAG hace autoselección por top hit
-            answer, context, table_path, image_path = run_your_current_rag(
+            answer, context, table_path, image_path, usage, timings = run_your_current_rag(
                 question=question,
                 top_k=top_k,
                 model=model,
@@ -594,6 +644,14 @@ class AskView(APIView):
                 want_all_tables=getattr(intent, "want_all_tables", False),
                 max_images_for_llm=IMAGES_LIMIT,
             )
+            
+            prompt_tokens, completion_tokens, total_tokens = normalize_usage(usage)
+
+            def download_bytes_timed_post(path: str) -> bytes:
+                t = time.perf_counter()
+                b = download_bytes(path)
+                timings["minio_ms"] += _ms(time.perf_counter() - t)
+                return b
 
             asset_doc_ids = effective_doc_ids
             if not asset_doc_ids:
@@ -614,7 +672,7 @@ class AskView(APIView):
             # Tablas
             if getattr(intent, "want_all_tables", False):
                 tabs_all = list_assets_for_docs(asset_doc_ids, kind="table", limit=30)
-                tabs_unique, dup_groups = dedup_table_assets_by_content(tabs_all)
+                tabs_unique, dup_groups = dedup_table_assets_by_content(tabs_all, downloader=download_bytes_timed_post)
                 for it in tabs_unique:
                     candidates.append({"kind": Attachment.KIND_TABLE, "path": it["path"], "title": it["title"]})
             else:
@@ -649,16 +707,27 @@ class AskView(APIView):
 
             # Crear assistant message
             try:
-                asst = Message.objects.create(
+                asst = db_timed(lambda: Message.objects.create(
                     conversation=conv,
                     role=Message.ROLE_ASSISTANT,
                     content=answer,
                     client_message_id=client_message_id,
-                    extra={"context": context, "intent": intent.__dict__},
+                    extra={
+                        "context": context,
+                        "intent": intent.__dict__,
+                        "usage": usage,  # <- raw
+                        "usage_norm": {  # <- útil para consultas rápidas
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        },
+                        "timings": timings,
+                        "model_used": model,
+                    },
                     # compat: solo el primero de cada tipo seleccionado
                     image_path=next((a["path"] for a in selected if a["kind"] == Attachment.KIND_IMAGE), None),
                     table_path=next((a["path"] for a in selected if a["kind"] == Attachment.KIND_TABLE), None),
-                )
+                ))
             except IntegrityError:
                 # por si entra doble request simultáneo
                 asst = Message.objects.get(
@@ -678,7 +747,40 @@ class AskView(APIView):
                 for a in selected
             ]
             if att_objs:
-                Attachment.objects.bulk_create(att_objs, ignore_conflicts=True)
+                db_timed(lambda: Attachment.objects.bulk_create(att_objs, ignore_conflicts=True))
+
+        timings_api["api_total_ms"] = _ms(time.perf_counter() - t_api0)
+        timings_api["api_post_rag_ms"] = max(0, timings_api["api_total_ms"] - timings_api["api_pre_rag_ms"])
+
+        n_img = sum(1 for a in selected if a["kind"] == Attachment.KIND_IMAGE)
+        n_tab = sum(1 for a in selected if a["kind"] == Attachment.KIND_TABLE)
+        n_att = len(selected)
+
+        db_timed(lambda: RagRequestLog.objects.create(
+            conversation_id=conv.id,
+            client_message_id=client_message_id,
+            model_requested=data.get("model"),
+            model_used=model,
+            fallback_reason=None,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            ok=True,
+            status_code=200,
+            embed_ms=timings.get("embed_ms", 0),
+            qdrant_ms=timings.get("qdrant_ms", 0),
+            minio_ms=timings.get("minio_ms", 0),
+            llm_ms=timings.get("llm_ms", 0),
+            total_ms=timings.get("total_ms", 0),
+            api_pre_rag_ms=timings_api["api_pre_rag_ms"],
+            api_post_rag_ms=timings_api["api_post_rag_ms"],
+            api_total_ms=timings_api["api_total_ms"],
+            db_ms=timings_api["db_ms"],
+
+            attachments_total=n_att, 
+            attachments_images=n_img, 
+            attachments_tables=n_tab,
+        ))
 
         payload = {
             "answer": asst.content,
